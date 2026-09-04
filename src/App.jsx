@@ -1,320 +1,466 @@
-import React, { useEffect, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
 import { supabase, usernameToEmail } from './supabase'
 
-const FIELD_TYPES = [
-  { value: 'text', label: 'テキスト' },
-  { value: 'select', label: '選択式' },
-  { value: 'date', label: '日付' },
-  { value: 'checkbox', label: 'チェック' },
-  { value: 'user', label: '担当者' }
+const FALLBACK_STATUS = [
+  { key: 'new', label: '新規' },
+  { key: 'in_progress', label: '作成中' },
+  { key: 'done', label: '完了' }
 ]
+
+const LONG_PRESS_MS = 260
+const EDGE_SIZE = 70
 
 export default function App() {
   const [session, setSession] = useState(null)
   const [profile, setProfile] = useState(null)
-  const [statuses, setStatuses] = useState([])
-  const [fields, setFields] = useState([])
-  const [tab, setTab] = useState('statuses')
+  const [items, setItems] = useState([])
+  const [statuses, setStatuses] = useState(FALLBACK_STATUS)
+  const [page, setPage] = useState(0)
+  const [selected, setSelected] = useState(null)
   const [busy, setBusy] = useState(false)
+  const [drag, setDrag] = useState(null)
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => setSession(data.session))
-    const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
-      setSession(nextSession)
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session)
     })
-    return () => data.subscription.unsubscribe()
+
+    const { data: listener } = supabase.auth.onAuthStateChange(
+      (_event, nextSession) => setSession(nextSession)
+    )
+
+    return () => listener.subscription.unsubscribe()
   }, [])
 
   useEffect(() => {
-    if (!session) {
-      setProfile(null)
-      return
-    }
+    if (!session) return
+
     loadProfile()
+    loadItems()
+    loadStatuses()
+
+    const imagesChannel = supabase
+      .channel('images-live')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'images' },
+        () => loadItems()
+      )
+      .subscribe()
+
+    const settingsChannel = supabase
+      .channel('status-settings-live')
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'app_statuses' },
+        () => loadStatuses()
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(imagesChannel)
+      supabase.removeChannel(settingsChannel)
+    }
   }, [session])
 
-  useEffect(() => {
-    if (profile?.role === 'admin') {
-      loadAll()
-    }
-  }, [profile])
-
   async function loadProfile() {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('profiles')
       .select('*')
       .eq('id', session.user.id)
       .single()
 
-    if (error) {
-      alert(`プロフィール取得失敗: ${error.message}`)
-      return
-    }
     setProfile(data)
   }
 
-  async function loadAll() {
-    const [{ data: s, error: se }, { data: f, error: fe }] = await Promise.all([
-      supabase.from('app_statuses').select('*').order('position'),
-      supabase.from('app_fields').select('*').order('position')
-    ])
+  async function loadItems() {
+    const { data, error } = await supabase
+      .from('images')
+      .select('*')
+      .order('created_at', { ascending: false })
 
-    if (se) alert(`ステータス取得失敗: ${se.message}`)
-    if (fe) alert(`管理項目取得失敗: ${fe.message}`)
+    if (!error) setItems(data || [])
+  }
 
-    setStatuses(s || [])
-    setFields(f || [])
+  async function loadStatuses() {
+    const { data, error } = await supabase
+      .from('app_statuses')
+      .select('key,label,position,is_active')
+      .eq('is_active', true)
+      .order('position', { ascending: true })
+
+    if (!error && data?.length) {
+      setStatuses(data)
+
+      setPage(prev => Math.min(prev, data.length - 1))
+    }
   }
 
   async function login(username, password) {
     setBusy(true)
+
     const { error } = await supabase.auth.signInWithPassword({
       email: usernameToEmail(username),
       password
     })
+
     setBusy(false)
     if (error) alert(error.message)
   }
 
-  async function addStatus() {
-    const label = prompt('追加するステータス名')
-    if (!label?.trim()) return
-    const key = `status_${Date.now()}`
+  async function upload(files) {
+    if (!files?.length) return
 
-    const { error } = await supabase.from('app_statuses').insert({
-      key,
-      label: label.trim(),
-      position: statuses.length
-    })
+    setBusy(true)
 
-    if (error) return alert(error.message)
-    loadAll()
-  }
+    try {
+      for (const file of Array.from(files)) {
+        try {
+          const ext = file.name.split('.').pop() || 'png'
+          const path = `${crypto.randomUUID()}.${ext}`
 
-  async function renameStatus(item) {
-    const label = prompt('新しい名前', item.label)
-    if (!label?.trim() || label.trim() === item.label) return
+          const { error: upErr } = await supabase.storage
+            .from('images')
+            .upload(path, file, {
+              contentType: file.type || undefined,
+              upsert: false
+            })
 
-    const { error } = await supabase
-      .from('app_statuses')
-      .update({ label: label.trim(), updated_at: new Date().toISOString() })
-      .eq('id', item.id)
+          if (upErr) {
+            alert(`アップロード失敗（${file.name}）: ${upErr.message}`)
+            continue
+          }
 
-    if (error) return alert(error.message)
-    loadAll()
-  }
+          const { data: publicData } = supabase.storage
+            .from('images')
+            .getPublicUrl(path)
 
-  async function deleteStatus(item) {
-    if (['new', 'in_progress', 'done'].includes(item.key)) {
-      return alert('新規・作成中・完了は基本ステータスなので削除できません。')
+          const { error: dbErr } = await supabase
+            .from('images')
+            .insert({
+              title: file.name,
+              note: '',
+              status: statuses[0]?.key || 'new',
+              storage_path: path,
+              public_url: publicData.publicUrl,
+              mime_type: file.type || '',
+              original_name: file.name,
+              created_by: session.user.id
+            })
+
+          if (dbErr) {
+            alert(`データ保存失敗（${file.name}）: ${dbErr.message}`)
+          }
+        } catch (error) {
+          alert(`アップロードエラー: ${error.message || error}`)
+        }
+      }
+    } finally {
+      setBusy(false)
+      loadItems()
     }
-    if (!confirm(`「${item.label}」を削除しますか？`)) return
+  }
+
+  async function moveToStatus(item, nextStatus) {
+    if (!item || item.status === nextStatus) return
 
     const { error } = await supabase
-      .from('app_statuses')
-      .delete()
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function moveStatus(item, direction) {
-    const index = statuses.findIndex(x => x.id === item.id)
-    const targetIndex = direction === 'up' ? index - 1 : index + 1
-    if (targetIndex < 0 || targetIndex >= statuses.length) return
-
-    const target = statuses[targetIndex]
-    await Promise.all([
-      supabase.from('app_statuses').update({ position: target.position }).eq('id', item.id),
-      supabase.from('app_statuses').update({ position: item.position }).eq('id', target.id)
-    ])
-    loadAll()
-  }
-
-  async function addField() {
-    const label = prompt('追加する管理項目名')
-    if (!label?.trim()) return
-
-    const type = prompt(
-      '種類を入力: text / select / date / checkbox / user',
-      'text'
-    )
-    if (!FIELD_TYPES.some(x => x.value === type)) {
-      return alert('種類は text / select / date / checkbox / user のどれかにしてください。')
-    }
-
-    const { error } = await supabase.from('app_fields').insert({
-      key: `field_${Date.now()}`,
-      label: label.trim(),
-      field_type: type,
-      position: fields.length
-    })
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function editField(item) {
-    const label = prompt('項目名', item.label)
-    if (!label?.trim()) return
-
-    const { error } = await supabase
-      .from('app_fields')
-      .update({ label: label.trim(), updated_at: new Date().toISOString() })
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function toggleRequired(item) {
-    const { error } = await supabase
-      .from('app_fields')
+      .from('images')
       .update({
-        is_required: !item.is_required,
+        status: nextStatus,
+        updated_by: session.user.id,
         updated_at: new Date().toISOString()
       })
       .eq('id', item.id)
 
-    if (error) return alert(error.message)
-    loadAll()
+    if (error) {
+      alert(`状態変更に失敗しました: ${error.message}`)
+      return
+    }
+
+    setItems(prev =>
+      prev.map(x =>
+        x.id === item.id ? { ...x, status: nextStatus } : x
+      )
+    )
+
+    setSelected(prev =>
+      prev?.id === item.id ? { ...prev, status: nextStatus } : prev
+    )
   }
 
-  async function toggleActive(item) {
+  async function saveMeta(item, patch) {
     const { error } = await supabase
-      .from('app_fields')
-      .update({
-        is_active: !item.is_active,
-        updated_at: new Date().toISOString()
-      })
+      .from('images')
+      .update(patch)
       .eq('id', item.id)
 
-    if (error) return alert(error.message)
-    loadAll()
+    if (error) {
+      alert(`保存に失敗しました: ${error.message}`)
+      return
+    }
+
+    setItems(prev =>
+      prev.map(x => x.id === item.id ? { ...x, ...patch } : x)
+    )
+
+    setSelected(prev =>
+      prev?.id === item.id ? { ...prev, ...patch } : prev
+    )
   }
 
-  async function deleteField(item) {
-    if (!confirm(`「${item.label}」を削除しますか？`)) return
+  async function remove(item) {
+    if (profile?.role !== 'admin') return
+    if (!confirm('この画像を削除しますか？')) return
+
+    await supabase.storage.from('images').remove([item.storage_path])
 
     const { error } = await supabase
-      .from('app_fields')
+      .from('images')
       .delete()
       .eq('id', item.id)
 
-    if (error) return alert(error.message)
-    loadAll()
+    if (error) {
+      alert(`削除に失敗しました: ${error.message}`)
+      return
+    }
+
+    setSelected(null)
+    loadItems()
   }
 
-  if (!session) return <Login onLogin={login} busy={busy} />
-
-  if (!profile) {
-    return <div className="center">確認中...</div>
+  function statusIndexFor(item) {
+    return statuses.findIndex(s => s.key === item.status)
   }
 
-  if (profile.role !== 'admin') {
-    return (
-      <div className="center">
-        <div className="blocked">
-          <h1>One Life Admin</h1>
-          <p>このアカウントには管理者権限がありません。</p>
-          <button onClick={() => supabase.auth.signOut()}>ログアウト</button>
-        </div>
-      </div>
-    )
+  function initialTargetPageFor(item) {
+    const origin = statusIndexFor(item)
+
+    if (origin < 0) return 0
+    if (origin === statuses.length - 1) return Math.max(0, origin - 1)
+    return Math.min(statuses.length - 1, origin + 1)
+  }
+
+  function startDrag(item, x, y) {
+    const originPage = statusIndexFor(item)
+    const targetPage = initialTargetPageFor(item)
+
+    setDrag({
+      item,
+      x,
+      y,
+      originPage,
+      targetPage
+    })
+  }
+
+  function updateDrag(x, y) {
+    setDrag(prev => {
+      if (!prev) return prev
+
+      const lastPage = statuses.length - 1
+      let targetPage = prev.targetPage
+
+      if (prev.originPage <= 0) {
+        targetPage = Math.min(1, lastPage)
+      } else if (prev.originPage >= lastPage) {
+        targetPage = Math.max(0, lastPage - 1)
+      } else {
+        const center = window.innerWidth / 2
+
+        if (x < center - 30) {
+          targetPage = prev.originPage - 1
+        } else if (x > center + 30) {
+          targetPage = prev.originPage + 1
+        }
+      }
+
+      if (targetPage !== prev.targetPage) {
+        setPage(targetPage)
+      }
+
+      if (
+        prev.originPage < lastPage &&
+        x > window.innerWidth - EDGE_SIZE
+      ) {
+        targetPage = prev.originPage + 1
+        setPage(targetPage)
+      }
+
+      if (
+        prev.originPage > 0 &&
+        x < EDGE_SIZE
+      ) {
+        targetPage = prev.originPage - 1
+        setPage(targetPage)
+      }
+
+      return {
+        ...prev,
+        x,
+        y,
+        targetPage
+      }
+    })
+  }
+
+  async function finishDrag() {
+    if (!drag) return
+
+    const { item, targetPage, originPage } = drag
+    setDrag(null)
+
+    if (targetPage === originPage) return
+
+    const nextStatus = statuses[targetPage]?.key
+    if (!nextStatus) return
+    await moveToStatus(item, nextStatus)
+    setPage(targetPage)
+  }
+
+  const grouped = useMemo(
+    () => statuses.map(status => items.filter(item => item.status === status.key)),
+    [items, statuses]
+  )
+
+  if (!session) {
+    return <Login onLogin={login} busy={busy} />
   }
 
   return (
     <div className="app">
       <header className="topbar">
         <div>
-          <div className="brand">One Life Admin</div>
-          <div className="tagline">管理者専用</div>
+          <div className="brand">One Life</div>
+          <div className="tagline">One Life, Live Free.</div>
         </div>
-        <button className="ghost" onClick={() => supabase.auth.signOut()}>
+
+        <button
+          className="ghost"
+          onClick={() => supabase.auth.signOut()}
+        >
           ログアウト
         </button>
       </header>
 
-      <nav className="tabs">
-        <button
-          className={tab === 'statuses' ? 'tab active' : 'tab'}
-          onClick={() => setTab('statuses')}
-        >
-          ステータス
-        </button>
-        <button
-          className={tab === 'fields' ? 'tab active' : 'tab'}
-          onClick={() => setTab('fields')}
-        >
-          管理項目
-        </button>
+      <nav className="page-tabs" style={{ gridTemplateColumns: `repeat(${Math.max(statuses.length, 1)}, minmax(92px, 1fr))` }}>
+        {statuses.map((status, index) => (
+          <button
+            key={status.key}
+            className={page === index ? 'page-tab active' : 'page-tab'}
+            onClick={() => setPage(index)}
+          >
+            <span>{status.label}</span>
+            <small>{grouped[index].length}</small>
+          </button>
+        ))}
       </nav>
 
-      {tab === 'statuses' ? (
-        <section className="panel">
-          <div className="section-head">
-            <div>
-              <h2>ステータス管理</h2>
-              <p>利用側のページ名・順番を管理します。</p>
-            </div>
-            <button className="primary" onClick={addStatus}>＋ 追加</button>
-          </div>
+      <label className="upload">
+        <input
+          type="file"
+          accept="image/*"
+          multiple
+          onChange={e => upload(e.target.files)}
+        />
+        <span>＋ 画像を追加</span>
+      </label>
 
-          <div className="list">
-            {statuses.map((item, index) => (
-              <div className="row" key={item.id}>
-                <div className="row-main">
-                  <strong>{item.label}</strong>
-                  <small>{item.key}</small>
+      {busy && <div className="busy">処理中...</div>}
+
+      <div className="pages-viewport">
+        <div
+          className="pages-track"
+          style={{ transform: `translateX(-${page * 100}%)` }}
+        >
+          {statuses.map((statusInfo, pageIndex) => (
+            <section className="status-page" key={statusInfo.key}>
+              <div className="page-heading">
+                <div>
+                  <h2>{statusInfo.label}</h2>
+                  <p>
+                    {statusInfo.key === 'new' && 'ここからスタート'}
+                    {statusInfo.key === 'in_progress' && '作成している画像'}
+                    {statusInfo.key === 'done' && '完成した画像'}
+                    {!['new', 'in_progress', 'done'].includes(statusInfo.key) && '管理中の画像'}
+                  </p>
                 </div>
 
-                <div className="row-actions">
-                  <button disabled={index === 0} onClick={() => moveStatus(item, 'up')}>↑</button>
-                  <button disabled={index === statuses.length - 1} onClick={() => moveStatus(item, 'down')}>↓</button>
-                  <button onClick={() => renameStatus(item)}>名前</button>
-                  <button className="danger-mini" onClick={() => deleteStatus(item)}>削除</button>
-                </div>
+                <strong>{grouped[pageIndex].length}</strong>
               </div>
-            ))}
+
+              {grouped[pageIndex].length === 0 ? (
+                <div className="empty">
+                  <span>
+                    {pageIndex === 0
+                      ? '画像を追加するとここに入ります'
+                      : '画像をここへドラッグして移動'}
+                  </span>
+                </div>
+              ) : (
+                <div className="gallery">
+                  {grouped[pageIndex].map(item => (
+                    <ImageCard
+                      key={item.id}
+                      item={item}
+                      onOpen={() => setSelected(item)}
+                      onDragStart={startDrag}
+                      onDragMove={updateDrag}
+                      onDragEnd={finishDrag}
+                    />
+                  ))}
+                </div>
+              )}
+            </section>
+          ))}
+        </div>
+      </div>
+
+      <div className="page-dots">
+        {statuses.map((statusInfo, index) => (
+          <button
+            key={statusInfo.key}
+            className={page === index ? 'dot active' : 'dot'}
+            onClick={() => setPage(index)}
+            aria-label={statusInfo.label}
+          />
+        ))}
+      </div>
+
+      {drag && (
+        <>
+          <div
+            className="drag-ghost"
+            style={{
+              left: drag.x,
+              top: drag.y
+            }}
+          >
+            <img
+              src={drag.item.public_url}
+              alt=""
+              draggable="false"
+            />
           </div>
-        </section>
-      ) : (
-        <section className="panel">
-          <div className="section-head">
-            <div>
-              <h2>管理項目</h2>
-              <p>担当者・優先度・締切などを追加できます。</p>
+
+          {drag.targetPage !== drag.originPage && (
+            <div className="drag-hint">
+              {statuses[drag.targetPage]?.label}へ移動
             </div>
-            <button className="primary" onClick={addField}>＋ 追加</button>
-          </div>
+          )}
+        </>
+      )}
 
-          <div className="list">
-            {fields.map(item => (
-              <div className="row field-row" key={item.id}>
-                <div className="row-main">
-                  <strong>{item.label}</strong>
-                  <small>
-                    {FIELD_TYPES.find(x => x.value === item.field_type)?.label || item.field_type}
-                    {item.is_required ? ' / 必須' : ''}
-                    {!item.is_active ? ' / 非表示' : ''}
-                  </small>
-                </div>
-
-                <div className="row-actions wrap">
-                  <button onClick={() => editField(item)}>名前</button>
-                  <button onClick={() => toggleRequired(item)}>
-                    {item.is_required ? '必須解除' : '必須'}
-                  </button>
-                  <button onClick={() => toggleActive(item)}>
-                    {item.is_active ? '非表示' : '表示'}
-                  </button>
-                  <button className="danger-mini" onClick={() => deleteField(item)}>削除</button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </section>
+      {selected && (
+        <Viewer
+          item={selected}
+          setItem={setSelected}
+          onClose={() => setSelected(null)}
+          onSave={saveMeta}
+          onDelete={remove}
+          isAdmin={profile?.role === 'admin'}
+          statuses={statuses}
+        />
       )}
     </div>
   )
@@ -327,14 +473,15 @@ function Login({ onLogin, busy }) {
   return (
     <div className="login">
       <div className="login-card">
-        <div className="brand big">One Life Admin</div>
-        <div className="tagline">管理者専用</div>
+        <div className="brand big">One Life</div>
+        <div className="tagline">One Life, Live Free.</div>
 
         <input
           placeholder="ユーザー名"
           value={username}
           onChange={e => setUsername(e.target.value)}
         />
+
         <input
           placeholder="パスワード"
           type="password"
@@ -342,9 +489,182 @@ function Login({ onLogin, busy }) {
           onChange={e => setPassword(e.target.value)}
         />
 
-        <button disabled={busy} onClick={() => onLogin(username, password)}>
+        <button
+          disabled={busy}
+          onClick={() => onLogin(username, password)}
+        >
           {busy ? 'ログイン中...' : 'ログイン'}
         </button>
+      </div>
+    </div>
+  )
+}
+
+function ImageCard({
+  item,
+  onOpen,
+  onDragStart,
+  onDragMove,
+  onDragEnd
+}) {
+  const timerRef = useRef(null)
+  const draggingRef = useRef(false)
+  const movedRef = useRef(false)
+  const startRef = useRef({ x: 0, y: 0 })
+
+  function clearTimer() {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current)
+      timerRef.current = null
+    }
+  }
+
+  function pointerDown(e) {
+    if (e.pointerType === 'mouse' && e.button !== 0) return
+
+    const clientX = e.clientX
+    const clientY = e.clientY
+    const pointerId = e.pointerId
+    const target = e.currentTarget
+
+    startRef.current = { x: clientX, y: clientY }
+    movedRef.current = false
+    draggingRef.current = false
+
+    timerRef.current = setTimeout(() => {
+      draggingRef.current = true
+      onDragStart(item, clientX, clientY)
+
+      try {
+        target.setPointerCapture(pointerId)
+      } catch {}
+    }, LONG_PRESS_MS)
+  }
+
+  function pointerMove(e) {
+    const dx = e.clientX - startRef.current.x
+    const dy = e.clientY - startRef.current.y
+
+    if (Math.abs(dx) > 8 || Math.abs(dy) > 8) {
+      movedRef.current = true
+    }
+
+    if (!draggingRef.current) {
+      if (Math.abs(dy) > 12) clearTimer()
+      return
+    }
+
+    e.preventDefault()
+    onDragMove(e.clientX, e.clientY)
+  }
+
+  async function pointerUp() {
+    clearTimer()
+
+    if (draggingRef.current) {
+      draggingRef.current = false
+      await onDragEnd()
+      return
+    }
+
+    if (!movedRef.current) onOpen()
+  }
+
+  function pointerCancel() {
+    clearTimer()
+
+    if (draggingRef.current) {
+      draggingRef.current = false
+      onDragEnd()
+    }
+  }
+
+  return (
+    <article
+      className="card"
+      onPointerDown={pointerDown}
+      onPointerMove={pointerMove}
+      onPointerUp={pointerUp}
+      onPointerCancel={pointerCancel}
+      onContextMenu={e => e.preventDefault()}
+    >
+      <img
+        src={item.public_url}
+        alt={item.title || ''}
+        loading="lazy"
+        draggable="false"
+        onDragStart={e => e.preventDefault()}
+      />
+
+      <div className="card-meta">
+        <strong>{item.title || item.original_name}</strong>
+        <small>{item.mime_type || 'image'}</small>
+      </div>
+    </article>
+  )
+}
+
+function Viewer({
+  item,
+  setItem,
+  onClose,
+  onSave,
+  onDelete,
+  isAdmin,
+  statuses
+}) {
+  return (
+    <div className="viewer">
+      <button className="close" onClick={onClose}>×</button>
+
+      <div className="viewer-image">
+        <img
+          src={item.public_url}
+          alt={item.title || ''}
+          draggable="false"
+          onDragStart={e => e.preventDefault()}
+        />
+      </div>
+
+      <div className="viewer-panel">
+        <div className="viewer-status">
+          {statuses.find(x => x.key === item.status)?.label || item.status}
+        </div>
+
+        <input
+          value={item.title || ''}
+          onChange={e =>
+            setItem({ ...item, title: e.target.value })
+          }
+          onBlur={e =>
+            onSave(item, { title: e.target.value })
+          }
+          placeholder="タイトル"
+        />
+
+        <textarea
+          value={item.note || ''}
+          onChange={e =>
+            setItem({ ...item, note: e.target.value })
+          }
+          onBlur={e =>
+            onSave(item, { note: e.target.value })
+          }
+          placeholder="メモ"
+        />
+
+        <div className="fileinfo">
+          {item.original_name} / {item.mime_type || 'unknown'}
+        </div>
+
+        {isAdmin && (
+          <button
+            className="danger"
+            onClick={() => onDelete(item)}
+          >
+            削除
+          </button>
+        )}
       </div>
     </div>
   )
