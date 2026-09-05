@@ -119,7 +119,8 @@ export default function App() {
       const result = await response.json().catch(() => ({}))
 
       if (!response.ok) {
-        alert(`ユーザー作成に失敗しました: ${result?.error || '不明なエラー'}`)
+        const detail = result?.detail ? `\n\n詳細:\n${result.detail}` : ''
+        alert(`ユーザー作成に失敗しました: ${result?.error || '不明なエラー'}${detail}`)
         return
       }
 
