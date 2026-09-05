@@ -20,6 +20,11 @@ export default async function handler(req, res) {
     return res.status(401).json({ error: 'Login required' })
   }
 
+  const adminHeaders = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`
+  }
+
   try {
     // 1) 呼び出した本人を確認
     const userResponse = await fetch(`${supabaseUrl}/auth/v1/user`, {
@@ -38,12 +43,7 @@ export default async function handler(req, res) {
     // 2) profiles で admin か確認
     const profileResponse = await fetch(
       `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(caller.id)}&select=id,role`,
-      {
-        headers: {
-          apikey: serviceRoleKey,
-          Authorization: `Bearer ${serviceRoleKey}`
-        }
-      }
+      { headers: adminHeaders }
     )
 
     if (!profileResponse.ok) {
@@ -51,6 +51,7 @@ export default async function handler(req, res) {
     }
 
     const profiles = await profileResponse.json()
+
     if (!profiles?.length || profiles[0].role !== 'admin') {
       return res.status(403).json({ error: 'Admin only' })
     }
@@ -75,17 +76,14 @@ export default async function handler(req, res) {
     const createResponse = await fetch(`${supabaseUrl}/auth/v1/admin/users`, {
       method: 'POST',
       headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
+        ...adminHeaders,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
         email,
         password,
         email_confirm: true,
-        user_metadata: {
-          username
-        }
+        user_metadata: { username }
       })
     })
 
@@ -93,41 +91,121 @@ export default async function handler(req, res) {
 
     if (!createResponse.ok) {
       return res.status(createResponse.status).json({
-        error: created?.msg || created?.message || created?.error || 'ユーザー作成に失敗しました'
+        error:
+          created?.msg ||
+          created?.message ||
+          created?.error ||
+          'ユーザー作成に失敗しました'
       })
     }
 
     const newUserId = created.id || created.user?.id
+
     if (!newUserId) {
       return res.status(500).json({ error: 'ユーザーIDを取得できませんでした' })
     }
 
-    // 4) One Life 用 profile を作成
-    const profileInsertResponse = await fetch(`${supabaseUrl}/rest/v1/profiles`, {
+    // 4) Auth作成時のトリガーなどで profile が既に作られているか確認
+    const existingProfileResponse = await fetch(
+      `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(newUserId)}&select=*`,
+      { headers: adminHeaders }
+    )
+
+    let existingProfiles = []
+
+    if (existingProfileResponse.ok) {
+      existingProfiles = await existingProfileResponse.json()
+    }
+
+    // 既に profile がある場合は role だけ user に揃える
+    if (existingProfiles?.length) {
+      const patchResponse = await fetch(
+        `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(newUserId)}`,
+        {
+          method: 'PATCH',
+          headers: {
+            ...adminHeaders,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal'
+          },
+          body: JSON.stringify({ role: 'user' })
+        }
+      )
+
+      if (!patchResponse.ok) {
+        const detail = await patchResponse.text()
+        return res.status(500).json({
+          error: 'プロフィール更新に失敗しました',
+          detail
+        })
+      }
+
+      return res.status(200).json({
+        ok: true,
+        user: { id: newUserId, username, email }
+      })
+    }
+
+    // 5) profile が無い場合は新規作成
+    // まず username 列がある構成を試す
+    let profileInsertResponse = await fetch(`${supabaseUrl}/rest/v1/profiles`, {
       method: 'POST',
       headers: {
-        apikey: serviceRoleKey,
-        Authorization: `Bearer ${serviceRoleKey}`,
+        ...adminHeaders,
         'Content-Type': 'application/json',
         Prefer: 'return=minimal'
       },
       body: JSON.stringify({
         id: newUserId,
+        username,
         role: 'user'
       })
     })
 
+    // username 列が無い構成なら id + role だけで再試行
     if (!profileInsertResponse.ok) {
-      // profile が作れなかった場合は Auth 側も戻す
+      const firstDetail = await profileInsertResponse.text()
+
+      if (
+        firstDetail.includes('username') &&
+        (
+          firstDetail.includes('column') ||
+          firstDetail.includes('schema cache')
+        )
+      ) {
+        profileInsertResponse = await fetch(`${supabaseUrl}/rest/v1/profiles`, {
+          method: 'POST',
+          headers: {
+            ...adminHeaders,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal'
+          },
+          body: JSON.stringify({
+            id: newUserId,
+            role: 'user'
+          })
+        })
+      } else {
+        await fetch(`${supabaseUrl}/auth/v1/admin/users/${newUserId}`, {
+          method: 'DELETE',
+          headers: adminHeaders
+        })
+
+        return res.status(500).json({
+          error: 'プロフィール作成に失敗しました',
+          detail: firstDetail
+        })
+      }
+    }
+
+    if (!profileInsertResponse.ok) {
+      const detail = await profileInsertResponse.text()
+
       await fetch(`${supabaseUrl}/auth/v1/admin/users/${newUserId}`, {
         method: 'DELETE',
-        headers: {
-          apikey: serviceRoleKey,
-          Authorization: `Bearer ${serviceRoleKey}`
-        }
+        headers: adminHeaders
       })
 
-      const detail = await profileInsertResponse.text()
       return res.status(500).json({
         error: 'プロフィール作成に失敗しました',
         detail
@@ -148,4 +226,3 @@ export default async function handler(req, res) {
     })
   }
 }
-
