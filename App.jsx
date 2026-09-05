@@ -76,6 +76,61 @@ export default function App() {
     if (error) alert(error.message)
   }
 
+  async function createUser() {
+    if (profile?.role !== 'admin') return
+
+    const username = prompt('追加するユーザー名')
+    if (!username?.trim()) return
+
+    const password = prompt('パスワード（6文字以上）')
+    if (!password) return
+
+    if (password.length < 6) {
+      alert('パスワードは6文字以上にしてください。')
+      return
+    }
+
+    setBusy(true)
+
+    try {
+      const { data: sessionData } = await supabase.auth.getSession()
+      const accessToken = sessionData?.session?.access_token
+
+      if (!accessToken) {
+        alert('ログイン情報を確認できませんでした。もう一度ログインしてください。')
+        return
+      }
+
+      const cleanUsername = username.trim()
+
+      const response = await fetch('/api/create-user', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`
+        },
+        body: JSON.stringify({
+          username: cleanUsername,
+          email: usernameToEmail(cleanUsername),
+          password
+        })
+      })
+
+      const result = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        alert(`ユーザー作成に失敗しました: ${result?.error || '不明なエラー'}`)
+        return
+      }
+
+      alert(`「${cleanUsername}」を作成しました`)
+    } catch (error) {
+      alert(`ユーザー作成に失敗しました: ${error?.message || error}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function addStatus() {
     const label = prompt('追加するステータス名')
     if (!label?.trim()) return
@@ -231,9 +286,20 @@ export default function App() {
           <div className="brand">One Life Admin</div>
           <div className="tagline">管理者専用</div>
         </div>
-        <button className="ghost" onClick={() => supabase.auth.signOut()}>
-          ログアウト
-        </button>
+
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <button
+            className="primary"
+            onClick={createUser}
+            disabled={busy}
+          >
+            ＋ユーザー
+          </button>
+
+          <button className="ghost" onClick={() => supabase.auth.signOut()}>
+            ログアウト
+          </button>
+        </div>
       </header>
 
       <nav className="tabs">
