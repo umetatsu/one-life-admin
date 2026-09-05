@@ -128,7 +128,7 @@ export default async function handler(req, res) {
             'Content-Type': 'application/json',
             Prefer: 'return=minimal'
           },
-          body: JSON.stringify({ role: 'user' })
+          body: JSON.stringify({ role: 'member' })
         }
       )
 
@@ -158,7 +158,7 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         id: newUserId,
         username,
-        role: 'user'
+        role: 'member'
       })
     })
 
@@ -182,7 +182,7 @@ export default async function handler(req, res) {
           },
           body: JSON.stringify({
             id: newUserId,
-            role: 'user'
+            role: 'member'
           })
         })
       } else {
