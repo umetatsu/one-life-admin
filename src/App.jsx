@@ -1,27 +1,22 @@
+// ONE LIFE ADMIN USER MANAGEMENT V1
 import React, { useEffect, useState } from 'react'
 import { supabase, usernameToEmail } from './supabase'
-
-const FIELD_TYPES = [
-  { value: 'text', label: 'テキスト' },
-  { value: 'select', label: '選択式' },
-  { value: 'date', label: '日付' },
-  { value: 'checkbox', label: 'チェック' },
-  { value: 'user', label: '担当者' }
-]
 
 export default function App() {
   const [session, setSession] = useState(null)
   const [profile, setProfile] = useState(null)
   const [statuses, setStatuses] = useState([])
-  const [fields, setFields] = useState([])
+  const [users, setUsers] = useState([])
   const [tab, setTab] = useState('statuses')
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => setSession(data.session))
+
     const { data } = supabase.auth.onAuthStateChange((_event, nextSession) => {
       setSession(nextSession)
     })
+
     return () => data.subscription.unsubscribe()
   }, [])
 
@@ -30,6 +25,7 @@ export default function App() {
       setProfile(null)
       return
     }
+
     loadProfile()
   }, [session])
 
@@ -38,6 +34,11 @@ export default function App() {
       loadAll()
     }
   }, [profile])
+
+  async function getAccessToken() {
+    const { data } = await supabase.auth.getSession()
+    return data?.session?.access_token || ''
+  }
 
   async function loadProfile() {
     const { data, error } = await supabase
@@ -50,30 +51,76 @@ export default function App() {
       alert(`プロフィール取得失敗: ${error.message}`)
       return
     }
+
     setProfile(data)
   }
 
   async function loadAll() {
-    const [{ data: s, error: se }, { data: f, error: fe }] = await Promise.all([
-      supabase.from('app_statuses').select('*').order('position'),
-      supabase.from('app_fields').select('*').order('position')
-    ])
+    await Promise.all([loadStatuses(), loadUsers()])
+  }
 
-    if (se) alert(`ステータス取得失敗: ${se.message}`)
-    if (fe) alert(`管理項目取得失敗: ${fe.message}`)
+  async function loadStatuses() {
+    const { data, error } = await supabase
+      .from('app_statuses')
+      .select('*')
+      .order('position')
 
-    setStatuses(s || [])
-    setFields(f || [])
+    if (error) {
+      alert(`ステータス取得失敗: ${error.message}`)
+      return
+    }
+
+    setStatuses(data || [])
+  }
+
+  async function loadUsers() {
+    try {
+      const accessToken = await getAccessToken()
+
+      if (!accessToken) {
+        alert('ログイン情報を確認できませんでした。')
+        return
+      }
+
+      const response = await fetch('/api/users', {
+        headers: {
+          Authorization: `Bearer ${accessToken}`
+        }
+      })
+
+      const result = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        alert(`ユーザー一覧取得失敗: ${result?.error || '不明なエラー'}`)
+        return
+      }
+
+      setUsers(result.users || [])
+    } catch (error) {
+      alert(`ユーザー一覧取得失敗: ${error?.message || error}`)
+    }
   }
 
   async function login(username, password) {
     setBusy(true)
+
     const { error } = await supabase.auth.signInWithPassword({
       email: usernameToEmail(username),
       password
     })
+
     setBusy(false)
+
     if (error) alert(error.message)
+  }
+
+  async function logout() {
+    setProfile(null)
+    setSession(null)
+
+    supabase.auth.signOut({ scope: 'local' }).catch(error => {
+      console.error('logout failed', error)
+    })
   }
 
   async function createUser() {
@@ -93,8 +140,7 @@ export default function App() {
     setBusy(true)
 
     try {
-      const { data: sessionData } = await supabase.auth.getSession()
-      const accessToken = sessionData?.session?.access_token
+      const accessToken = await getAccessToken()
 
       if (!accessToken) {
         alert('ログイン情報を確認できませんでした。もう一度ログインしてください。')
@@ -119,14 +165,53 @@ export default function App() {
       const result = await response.json().catch(() => ({}))
 
       if (!response.ok) {
-        const detail = result?.detail ? `\n\n詳細:\n${result.detail}` : ''
-        alert(`ユーザー作成に失敗しました: ${result?.error || '不明なエラー'}${detail}`)
+        alert(`ユーザー作成に失敗しました: ${result?.error || '不明なエラー'}`)
         return
       }
 
       alert(`「${cleanUsername}」を作成しました`)
+      await loadUsers()
     } catch (error) {
       alert(`ユーザー作成に失敗しました: ${error?.message || error}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function deleteUser(item) {
+    if (!item?.id) return
+
+    if (item.id === session?.user?.id) {
+      alert('現在ログイン中の管理者は削除できません。')
+      return
+    }
+
+    if (!confirm(`「${item.username}」を削除しますか？`)) return
+
+    setBusy(true)
+
+    try {
+      const accessToken = await getAccessToken()
+
+      const response = await fetch('/api/users', {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${accessToken}`
+        },
+        body: JSON.stringify({ id: item.id })
+      })
+
+      const result = await response.json().catch(() => ({}))
+
+      if (!response.ok) {
+        alert(`ユーザー削除に失敗しました: ${result?.error || '不明なエラー'}`)
+        return
+      }
+
+      await loadUsers()
+    } catch (error) {
+      alert(`ユーザー削除に失敗しました: ${error?.message || error}`)
     } finally {
       setBusy(false)
     }
@@ -135,6 +220,7 @@ export default function App() {
   async function addStatus() {
     const label = prompt('追加するステータス名')
     if (!label?.trim()) return
+
     const key = `status_${Date.now()}`
 
     const { error } = await supabase.from('app_statuses').insert({
@@ -144,7 +230,8 @@ export default function App() {
     })
 
     if (error) return alert(error.message)
-    loadAll()
+
+    loadStatuses()
   }
 
   async function renameStatus(item) {
@@ -153,17 +240,22 @@ export default function App() {
 
     const { error } = await supabase
       .from('app_statuses')
-      .update({ label: label.trim(), updated_at: new Date().toISOString() })
+      .update({
+        label: label.trim(),
+        updated_at: new Date().toISOString()
+      })
       .eq('id', item.id)
 
     if (error) return alert(error.message)
-    loadAll()
+
+    loadStatuses()
   }
 
   async function deleteStatus(item) {
     if (['new', 'in_progress', 'done'].includes(item.key)) {
       return alert('新規・作成中・完了は基本ステータスなので削除できません。')
     }
+
     if (!confirm(`「${item.label}」を削除しますか？`)) return
 
     const { error } = await supabase
@@ -172,97 +264,35 @@ export default function App() {
       .eq('id', item.id)
 
     if (error) return alert(error.message)
-    loadAll()
+
+    loadStatuses()
   }
 
   async function moveStatus(item, direction) {
     const index = statuses.findIndex(x => x.id === item.id)
     const targetIndex = direction === 'up' ? index - 1 : index + 1
+
     if (targetIndex < 0 || targetIndex >= statuses.length) return
 
     const target = statuses[targetIndex]
+
     await Promise.all([
-      supabase.from('app_statuses').update({ position: target.position }).eq('id', item.id),
-      supabase.from('app_statuses').update({ position: item.position }).eq('id', target.id)
+      supabase
+        .from('app_statuses')
+        .update({ position: target.position })
+        .eq('id', item.id),
+      supabase
+        .from('app_statuses')
+        .update({ position: item.position })
+        .eq('id', target.id)
     ])
-    loadAll()
+
+    loadStatuses()
   }
 
-  async function addField() {
-    const label = prompt('追加する管理項目名')
-    if (!label?.trim()) return
-
-    const type = prompt(
-      '種類を入力: text / select / date / checkbox / user',
-      'text'
-    )
-    if (!FIELD_TYPES.some(x => x.value === type)) {
-      return alert('種類は text / select / date / checkbox / user のどれかにしてください。')
-    }
-
-    const { error } = await supabase.from('app_fields').insert({
-      key: `field_${Date.now()}`,
-      label: label.trim(),
-      field_type: type,
-      position: fields.length
-    })
-
-    if (error) return alert(error.message)
-    loadAll()
+  if (!session) {
+    return <Login onLogin={login} busy={busy} />
   }
-
-  async function editField(item) {
-    const label = prompt('項目名', item.label)
-    if (!label?.trim()) return
-
-    const { error } = await supabase
-      .from('app_fields')
-      .update({ label: label.trim(), updated_at: new Date().toISOString() })
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function toggleRequired(item) {
-    const { error } = await supabase
-      .from('app_fields')
-      .update({
-        is_required: !item.is_required,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function toggleActive(item) {
-    const { error } = await supabase
-      .from('app_fields')
-      .update({
-        is_active: !item.is_active,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  async function deleteField(item) {
-    if (!confirm(`「${item.label}」を削除しますか？`)) return
-
-    const { error } = await supabase
-      .from('app_fields')
-      .delete()
-      .eq('id', item.id)
-
-    if (error) return alert(error.message)
-    loadAll()
-  }
-
-  if (!session) return <Login onLogin={login} busy={busy} />
 
   if (!profile) {
     return <div className="center">確認中...</div>
@@ -274,7 +304,7 @@ export default function App() {
         <div className="blocked">
           <h1>One Life Admin</h1>
           <p>このアカウントには管理者権限がありません。</p>
-          <button onClick={() => supabase.auth.signOut()}>ログアウト</button>
+          <button onClick={logout}>ログアウト</button>
         </div>
       </div>
     )
@@ -297,7 +327,7 @@ export default function App() {
             ＋ユーザー
           </button>
 
-          <button className="ghost" onClick={() => supabase.auth.signOut()}>
+          <button className="ghost" onClick={logout}>
             ログアウト
           </button>
         </div>
@@ -310,11 +340,12 @@ export default function App() {
         >
           ステータス
         </button>
+
         <button
-          className={tab === 'fields' ? 'tab active' : 'tab'}
-          onClick={() => setTab('fields')}
+          className={tab === 'users' ? 'tab active' : 'tab'}
+          onClick={() => setTab('users')}
         >
-          管理項目
+          ユーザー管理
         </button>
       </nav>
 
@@ -325,7 +356,10 @@ export default function App() {
               <h2>ステータス管理</h2>
               <p>利用側のページ名・順番を管理します。</p>
             </div>
-            <button className="primary" onClick={addStatus}>＋ 追加</button>
+
+            <button className="primary" onClick={addStatus}>
+              ＋ 追加
+            </button>
           </div>
 
           <div className="list">
@@ -337,10 +371,30 @@ export default function App() {
                 </div>
 
                 <div className="row-actions">
-                  <button disabled={index === 0} onClick={() => moveStatus(item, 'up')}>↑</button>
-                  <button disabled={index === statuses.length - 1} onClick={() => moveStatus(item, 'down')}>↓</button>
-                  <button onClick={() => renameStatus(item)}>名前</button>
-                  <button className="danger-mini" onClick={() => deleteStatus(item)}>削除</button>
+                  <button
+                    disabled={index === 0}
+                    onClick={() => moveStatus(item, 'up')}
+                  >
+                    ↑
+                  </button>
+
+                  <button
+                    disabled={index === statuses.length - 1}
+                    onClick={() => moveStatus(item, 'down')}
+                  >
+                    ↓
+                  </button>
+
+                  <button onClick={() => renameStatus(item)}>
+                    名前
+                  </button>
+
+                  <button
+                    className="danger-mini"
+                    onClick={() => deleteStatus(item)}
+                  >
+                    削除
+                  </button>
                 </div>
               </div>
             ))}
@@ -350,36 +404,55 @@ export default function App() {
         <section className="panel">
           <div className="section-head">
             <div>
-              <h2>管理項目</h2>
-              <p>担当者・優先度・締切などを追加できます。</p>
+              <h2>ユーザー管理</h2>
+              <p>利用ユーザーの追加・削除を管理します。</p>
             </div>
-            <button className="primary" onClick={addField}>＋ 追加</button>
+
+            <button
+              className="primary"
+              onClick={createUser}
+              disabled={busy}
+            >
+              ＋ 追加
+            </button>
           </div>
 
           <div className="list">
-            {fields.map(item => (
-              <div className="row field-row" key={item.id}>
-                <div className="row-main">
-                  <strong>{item.label}</strong>
-                  <small>
-                    {FIELD_TYPES.find(x => x.value === item.field_type)?.label || item.field_type}
-                    {item.is_required ? ' / 必須' : ''}
-                    {!item.is_active ? ' / 非表示' : ''}
-                  </small>
-                </div>
+            {users.map(item => {
+              const isMe = item.id === session?.user?.id
 
-                <div className="row-actions wrap">
-                  <button onClick={() => editField(item)}>名前</button>
-                  <button onClick={() => toggleRequired(item)}>
-                    {item.is_required ? '必須解除' : '必須'}
-                  </button>
-                  <button onClick={() => toggleActive(item)}>
-                    {item.is_active ? '非表示' : '表示'}
-                  </button>
-                  <button className="danger-mini" onClick={() => deleteField(item)}>削除</button>
+              return (
+                <div className="row" key={item.id}>
+                  <div className="row-main">
+                    <strong>
+                      {item.username}
+                      {isMe ? '（自分）' : ''}
+                    </strong>
+                    <small>
+                      {item.role === 'admin' ? '管理者' : 'ユーザー'}
+                    </small>
+                  </div>
+
+                  <div className="row-actions">
+                    <button
+                      className="danger-mini"
+                      disabled={isMe || busy}
+                      onClick={() => deleteUser(item)}
+                    >
+                      {isMe ? '削除不可' : '削除'}
+                    </button>
+                  </div>
+                </div>
+              )
+            })}
+
+            {!users.length && (
+              <div className="row">
+                <div className="row-main">
+                  <strong>ユーザーがありません</strong>
                 </div>
               </div>
-            ))}
+            )}
           </div>
         </section>
       )}
@@ -402,6 +475,7 @@ function Login({ onLogin, busy }) {
           value={username}
           onChange={e => setUsername(e.target.value)}
         />
+
         <input
           placeholder="パスワード"
           type="password"
@@ -409,7 +483,10 @@ function Login({ onLogin, busy }) {
           onChange={e => setPassword(e.target.value)}
         />
 
-        <button disabled={busy} onClick={() => onLogin(username, password)}>
+        <button
+          disabled={busy}
+          onClick={() => onLogin(username, password)}
+        >
           {busy ? 'ログイン中...' : 'ログイン'}
         </button>
       </div>
